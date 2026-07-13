@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Buscador y Organizador de Archivos
+Buscador y Organizador para archivo del usuario
 =================================
 Programa que busca archivos en el directorio del usuario y los ordena
 alfabéticamente, por año y por tipo de archivo.
