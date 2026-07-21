@@ -3,9 +3,9 @@
 """
 Buscador y organizador de archivos - Proyecto Edmar, Nellfrancis, Victor
 ====================================================
-Este script busca archivos en el directorio que le digas y los ordena
-alfabéticamente, por año o por extensión. También los puede agrupar.
-Hecho por un humano (o eso creemos).
+Este script explora una carpeta y sus subcarpetas para encontrar archivos.
+Los resultados se pueden ordenar por nombre, por año o por tipo de archivo,
+y también se puede guardar un reporte en texto o JSON.
 """
 
 import os
@@ -16,23 +16,19 @@ import argparse
 from collections import defaultdict
 import json
 
-# --- Configuración de depuración (a veces lo activo, a veces no) ---
-DEBUG = False  # Cambiar a True para ver mensajes
+DEBUG = False
 
 def debug_print(msg):
     if DEBUG:
         print(f"[DEBUG] {msg}")
 
-# FIXME: quizá debería usar logging en lugar de prints, pero bueno
-
 # -------------------------------------------------
 
 class FileInfo:
-    """Clase para guardar información de un archivo/directorio."""
+    """Información de un archivo o directorio."""
     def __init__(self, path):
         self.path = path
         self.name = path.name
-        # Si no tiene extensión, le ponemos 'sin_ext'
         self.ext = path.suffix.lower() if path.suffix else 'sin_extension'
         self.size = path.stat().st_size if path.exists() else 0
         self.mod_time = datetime.fromtimestamp(path.stat().st_mtime) if path.exists() else datetime.now()
@@ -40,17 +36,15 @@ class FileInfo:
         self.is_file = path.is_file()
         self.is_dir = path.is_dir()
         self.parent = path.parent
-        # Esto lo puse para probar, pero no lo uso (despiste humano)
-        self.temp = "no usado"
 
     @property
     def year(self):
-        """Año de modificación (para ordenar)"""
+        """Año de última modificación."""
         return self.mod_time.year
 
     @property
     def tipo(self):
-        """Tipo = extensión sin el punto"""
+        """Tipo de archivo sin el punto inicial."""
         return self.ext[1:] if self.ext.startswith('.') else self.ext
 
     def to_dict(self):
@@ -85,59 +79,65 @@ class FileInfo:
 # -------------------------------------------------
 
 class FileSearcher:
-    """Clase principal para buscar y ordenar archivos"""
+    """Busca, ordena y agrupa archivos en un camino dado."""
     def __init__(self, base_path=None, max_depth=5):
-        # Si no dan ruta, usamos el home del usuario
         self.base_path = base_path if base_path else Path.home()
         self.max_depth = max_depth
-        self.files = []   # Lista de FileInfo
-        # Extensiones y carpetas que no me interesan (porque son basura)
+        self.files = []
         self.ignored_ext = {'.tmp', '.temp', '.log', '.cache', '.pyc'}
         self.ignored_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.idea'}
-        # Esto es para pruebas, no lo borro
-        self.extra_info = ""
+
+    def _is_ignored_directory(self, dir_name):
+        return dir_name in self.ignored_dirs
+
+    def _is_ignored_file(self, path):
+        return path.suffix.lower() in self.ignored_ext or not path.exists() or not os.access(path, os.R_OK)
+
+    def _is_too_deep(self, root):
+        rel_path = Path(root).relative_to(self.base_path)
+        depth = len(rel_path.parts) if rel_path != Path('.') else 0
+        return depth > self.max_depth
+
+    def _file_infos_in_root(self, root, filenames):
+        return (
+            FileInfo(Path(root) / fname)
+            for fname in filenames
+            if not self._is_ignored_file(Path(root) / fname)
+        )
+
+    def _directory_infos(self):
+        return (
+            FileInfo(Path(root) / dname)
+            for root, dirs, _ in os.walk(self.base_path)
+            for dname in dirs
+            if not self._is_ignored_directory(dname)
+        )
+
+    def _report_progress(self, count, show_progress):
+        if show_progress and count % 100 == 0:
+            print(f"Ya procesados {count} archivos...", flush=True)
 
     def search(self, include_dirs=False, show_progress=True):
         """Busca archivos recursivamente, con límite de profundidad."""
         self.files = []
         count = 0
-        print(f"Buscando en: {self.base_path} (profundidad máxima: {self.max_depth})")
-        # Recorremos el árbol
-        for root, dirs, filenames in os.walk(self.base_path):
-            # Filtramos directorios ignorados (modificamos la lista in-place)
-            dirs[:] = [d for d in dirs if d not in self.ignored_dirs]
+        print(f"Explorando {self.base_path} hasta {self.max_depth} niveles de profundidad...")
 
-            # Calculamos profundidad actual
-            rel_path = Path(root).relative_to(self.base_path)
-            depth = len(rel_path.parts) if rel_path != Path('.') else 0
-            if depth > self.max_depth:
-                # Si ya superamos la profundidad, no entramos más abajo
+        for root, dirs, filenames in os.walk(self.base_path):
+            dirs[:] = [d for d in dirs if not self._is_ignored_directory(d)]
+
+            if self._is_too_deep(root):
                 continue
 
-            # Procesar archivos
-            for fname in filenames:
-                file_path = Path(root) / fname
-                # Saltar extensiones molestas
-                if file_path.suffix.lower() in self.ignored_ext:
-                    continue
-                # Comprobar que se puede leer
-                if not file_path.exists() or not os.access(file_path, os.R_OK):
-                    continue
-                self.files.append(FileInfo(file_path))
+            for file_info in self._file_infos_in_root(root, filenames):
+                self.files.append(file_info)
                 count += 1
-                if show_progress and count % 100 == 0:
-                    print(f"Llevo {count} archivos...", flush=True)
+                self._report_progress(count, show_progress)
 
-        # Si quieren incluir directorios, los añadimos (pero sin profundizar más)
         if include_dirs:
-            for root, dirs, _ in os.walk(self.base_path):
-                for dname in dirs:
-                    dir_path = Path(root) / dname
-                    if dname not in self.ignored_dirs:
-                        self.files.append(FileInfo(dir_path))
+            self.files.extend(self._directory_infos())
 
-        print(f"Búsqueda terminada. Encontrados {len(self.files)} elementos.")
-        # print("Esto es un mensaje de depuración que me olvidé de quitar")  # lo dejo comentado
+        print(f"Búsqueda completa. Encontrados {len(self.files)} elementos.")
         return self.files
 
     def sort_alphabetic(self, files=None):
@@ -177,17 +177,11 @@ class FileSearcher:
         return dict(grouped)
 
     def filter_by_extension(self, exts, files=None):
-        """Filtra por lista de extensiones (pueden ser '.txt' o 'txt')"""
+        """Filtra por lista de extensiones (pueden ser '.txt' o 'txt')."""
         if files is None:
             files = self.files
-        result = []
-        for f in files:
-            for e in exts:
-                e_clean = e if e.startswith('.') else '.' + e
-                if f.ext == e_clean or f.tipo == e:
-                    result.append(f)
-                    break
-        return result
+        normalized = {e if e.startswith('.') else '.' + e for e in exts}
+        return [f for f in files if f.ext in normalized or f.tipo in normalized]
 
     def filter_by_year_range(self, start_year, end_year, files=None):
         """Filtra por rango de años (inclusive)"""
@@ -199,7 +193,6 @@ class FileSearcher:
         """Genera un reporte en texto plano con estadísticas y listado."""
         if files is None:
             files = self.files
-        # Ordenar según el tipo
         if sort_type == 'alphabetic':
             sorted_files = self.sort_alphabetic(files)
             title = "Ordenado Alfabéticamente"
@@ -221,22 +214,21 @@ class FileSearcher:
         lines.append(f"Total de elementos: {len(sorted_files)}")
         lines.append("-"*80)
 
-        # Estadísticas por tipo
         grouped = self.group_by_type(sorted_files)
         lines.append("\nEstadísticas por tipo:")
-        for t, flist in sorted(grouped.items()):
-            total_size = sum(f.size for f in flist)
-            lines.append(f"  {t}: {len(flist)} archivos, {FileInfo._format_size(total_size)}")
+        for t, archivos in sorted(grouped.items()):
+            total_size = sum(archivo.size for archivo in archivos)
+            lines.append(f"  {t}: {len(archivos)} elementos, {FileInfo._format_size(total_size)}")
 
         lines.append("-"*80)
-        lines.append("\nDetalle de archivos:")
-        for i, f in enumerate(sorted_files, 1):
-            lines.append(f"{i:4d}. {f.name}")
-            lines.append(f"      Ruta: {f.path}")
-            lines.append(f"      Tipo: {f.tipo}")
-            lines.append(f"      Año: {f.year}")
-            lines.append(f"      Tamaño: {FileInfo._format_size(f.size)}")
-            lines.append(f"      Modificado: {f.mod_time.strftime('%Y-%m-%d %H:%M')}")
+        lines.append("\nDetalle de elementos:")
+        for i, archivo in enumerate(sorted_files, 1):
+            lines.append(f"{i:4d}. {archivo.name}")
+            lines.append(f"      Ruta: {archivo.path}")
+            lines.append(f"      Tipo: {archivo.tipo}")
+            lines.append(f"      Año: {archivo.year}")
+            lines.append(f"      Tamaño: {FileInfo._format_size(archivo.size)}")
+            lines.append(f"      Modificado: {archivo.mod_time.strftime('%Y-%m-%d %H:%M')}")
             if i < len(sorted_files):
                 lines.append("")
         lines.append("="*80)
@@ -244,22 +236,21 @@ class FileSearcher:
 
 
 # -------------------------------------------------
-# Argumentos de línea de comandos (versión simplificada)
+# Opciones del script
 # -------------------------------------------------
 def parse_args():
-    parser = argparse.ArgumentParser(description='Buscador de archivos con ordenación (hecho por humanos)')
-    parser.add_argument('--path', default=str(Path.home()), help='Ruta donde buscar (default: home)')
+    parser = argparse.ArgumentParser(description='Buscador de archivos amigable y fácil de usar')
+    parser.add_argument('--path', default=str(Path.home()), help='Carpeta donde empezar la búsqueda; si no lo dices, uso tu carpeta home')
     parser.add_argument('--sort', choices=['alphabetic','year','type'], default='alphabetic',
-                        help='Orden: alphabetic, year, type (default: alphabetic)')
-    parser.add_argument('--filter', help='Filtrar por extensiones separadas por coma (ej: .txt,.pdf)')
-    parser.add_argument('--year-range', help='Rango de años, ej: 2020-2024')
-    parser.add_argument('--max-depth', type=int, default=5, help='Profundidad máxima (default: 5)')
-    parser.add_argument('--include-dirs', action='store_true', help='Incluir directorios en la lista')
-    parser.add_argument('--output', help='Guardar reporte en archivo')
-    parser.add_argument('--json', action='store_true', help='Salida en JSON')
-    parser.add_argument('--no-progress', action='store_true', help='No mostrar progreso')
-    # Corrijo el error: el flag corto debe ser '-v', no '--v'
-    parser.add_argument('-v', '--verbose', action='store_true', help='Modo verbose (mensajes de depuración)')
+                        help='Ordenar los resultados: alphabetic, year o type')
+    parser.add_argument('--filter', help='Filtrar por extensiones separadas por coma, por ejemplo .txt,.pdf')
+    parser.add_argument('--year-range', help='Rango de años para filtrar, ej: 2020-2024')
+    parser.add_argument('--max-depth', type=int, default=5, help='Profundidad máxima de búsqueda')
+    parser.add_argument('--include-dirs', action='store_true', help='Incluir carpetas también en el listado')
+    parser.add_argument('--output', help='Guardar el reporte en un archivo')
+    parser.add_argument('--json', action='store_true', help='Mostrar resultados en formato JSON')
+    parser.add_argument('--no-progress', action='store_true', help='No mostrar mensajes de progreso durante la búsqueda')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Mostrar mensajes adicionales para depuración')
     return parser.parse_args()
 
 
@@ -275,25 +266,24 @@ def main():
         files = searcher.search(include_dirs=args.include_dirs, show_progress=not args.no_progress)
 
         if not files:
-            print("No se encontraron archivos. ¡Qué raro!")
+            print("No se encontraron archivos en la ruta indicada.")
             return
 
-        # Filtros
         if args.filter:
             exts = [e.strip() for e in args.filter.split(',')]
             files = searcher.filter_by_extension(exts, files)
-            print(f"Filtro por extensiones: {len(files)} archivos restantes")
+            print(f"Aplicado filtro de extensiones: {len(files)} elementos restantes")
 
         if args.year_range:
             try:
                 start, end = map(int, args.year_range.split('-'))
                 files = searcher.filter_by_year_range(start, end, files)
-                print(f"Filtro por años: {len(files)} archivos restantes")
+                print(f"Aplicado filtro por años: {len(files)} elementos restantes")
             except ValueError:
-                print("Error: el rango de años debe ser AAAA-AAAA")
+                print("Error: el rango de años debe tener el formato AAAA-AAAA")
                 sys.exit(1)
 
-        # Generar reporte
+        # Preparar el reporte para mostrar o guardar
         report = searcher.generate_report(files, args.sort)
 
         if args.json:
