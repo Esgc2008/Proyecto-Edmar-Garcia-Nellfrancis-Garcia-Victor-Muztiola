@@ -1,338 +1,235 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Buscador y organizador de archivos - Proyecto Edmar, Nellfrancis, Victor
-====================================================
-Este script explora una carpeta y sus subcarpetas para encontrar archivos.
-Los resultados se pueden ordenar por nombre, por año o por tipo de archivo,
-y también se puede guardar un reporte en texto o JSON.
-"""
+"""Buscador y organizador de archivos."""
 
-import os
-import sys
-from pathlib import Path
-from datetime import datetime
 import argparse
-from collections import defaultdict
 import json
+import os
+from datetime import datetime
+from pathlib import Path
 
-DEBUG = False
+EXTENSIONES_IGNORADAS = {'.tmp', '.temp', '.log', '.cache', '.pyc'}
+CARPETAS_IGNORADAS = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.idea'}
 
-def debug_print(msg):
-    if DEBUG:
-        print(f"[DEBUG] {msg}")
 
-def _human_count(n):
-    """Formatea números grandes para que sean fáciles de leer."""
-    try:
-        return f"{n:,}"
-    except Exception:
-        return str(n)
+def fmt_num(n):
+    return f"{n:,}" if n >= 1000 else str(n)
 
-# -------------------------------------------------
 
-class FileInfo:
-    """Información de un archivo o directorio."""
-    def __init__(self, path):
-        self.path = path
-        self.name = path.name
-        # Si no tiene extensión, le ponemos 'sin_extension'
-        self.ext = path.suffix.lower() if path.suffix else 'sin_extension'
-        self.size = path.stat().st_size if path.exists() else 0
-        self.mod_time = datetime.fromtimestamp(path.stat().st_mtime) if path.exists() else datetime.now()
-        self.creat_time = datetime.fromtimestamp(path.stat().st_ctime) if path.exists() else datetime.now()
-        self.is_file = path.is_file()
-        self.is_dir = path.is_dir()
-        self.parent = path.parent
+def fmt_size(b):
+    if b == 0:
+        return "0.00 B"
+    for i, unidad in enumerate(('B', 'KB', 'MB', 'GB', 'TB')):
+        if b < 1024 or unidad == 'TB':
+            return f"{b / 1024**i:.2f} {unidad}"
 
-    @property
-    def year(self):
-        """Año de última modificación."""
-        return self.mod_time.year
+
+class ArchivoInfo(object):
+    """Información de un archivo o carpeta."""
+
+    def __init__(self, ruta):
+        self.ruta = ruta
+        self.nombre = ruta.name
+        self.extension = ruta.suffix.lower() or 'sin_extension'
+        self.es_archivo = ruta.is_file()
+        self.es_carpeta = ruta.is_dir()
+        if ruta.exists():
+            st = ruta.stat()
+            self.tamano = st.st_size
+            self.fecha_modificacion = datetime.fromtimestamp(st.st_mtime)
+            self.fecha_creacion = datetime.fromtimestamp(st.st_ctime)
+        else:
+            self.tamano = 0
+            self.fecha_modificacion = self.fecha_creacion = datetime.now()
 
     @property
     def tipo(self):
-        """Tipo de archivo sin el punto inicial."""
-        return self.ext[1:] if self.ext.startswith('.') else self.ext
+        return self.extension[1:] if self.extension.startswith('.') else self.extension
 
-    def to_dict(self):
-        """Convierte a diccionario (para JSON)"""
+    @property
+    def anio(self):
+        return self.fecha_modificacion.year
+
+    def a_diccionario(self):
         return {
-            'nombre': self.name,
-            'ruta': str(self.path),
-            'extension': self.ext,
+            'nombre': self.nombre,
+            'ruta': str(self.ruta),
+            'extension': self.extension,
             'tipo': self.tipo,
-            'tamaño_bytes': self.size,
-            'tamaño_legible': self._format_size(self.size),
-            'fecha_modificacion': self.mod_time.strftime('%Y-%m-%d %H:%M:%S'),
-            'fecha_creacion': self.creat_time.strftime('%Y-%m-%d %H:%M:%S'),
-            'año': self.year,
-            'es_archivo': self.is_file,
-            'es_directorio': self.is_dir
+            'tamano_bytes': self.tamano,
+            'tamano_legible': fmt_size(self.tamano),
+            'fecha_modificacion': self.fecha_modificacion.strftime('%Y-%m-%d %H:%M:%S'),
+            'fecha_creacion': self.fecha_creacion.strftime('%Y-%m-%d %H:%M:%S'),
+            'anio': self.anio,
+            'es_archivo': self.es_archivo,
+            'es_carpeta': self.es_carpeta,
         }
 
-    @staticmethod
-    def _format_size(size_bytes):
-        """Formato bonito de tamaño"""
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if size_bytes < 1024.0:
-                return f"{size_bytes:.2f} {unit}"
-            size_bytes /= 1024.0
-        return f"{size_bytes:.2f} PB"
 
-    def __repr__(self):
-        return f"FileInfo({self.name})"
+class BuscadorArchivos(object):
+    """Busca y organiza archivos dentro de una carpeta."""
 
+    def __init__(self, ruta_base=None, profundidad_maxima=5):
+        self.ruta_base = Path(ruta_base) if ruta_base else Path.home()
+        self.profundidad_maxima = profundidad_maxima
+        self.archivos = []
 
-# -------------------------------------------------
+    def es_ignorado(self, ruta):
+        return ruta.is_file() and ruta.suffix.lower() in EXTENSIONES_IGNORADAS
 
-class FileSearcher:
-    """Busca, ordena y agrupa archivos en un camino dado."""
-    def __init__(self, base_path=None, max_depth=5):
-        # Si no dan ruta, usamos el home del usuario
-        self.base_path = base_path if base_path else Path.home()
-        self.max_depth = max_depth
-        self.files = []  # Lista de FileInfo
-        # Extensiones y carpetas que no me interesan (porque son basura)
-        self.ignored_ext = {'.tmp', '.temp', '.log', '.cache', '.pyc'}
-        self.ignored_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.idea'}
+    def _ruta_valida(self, ruta):
+        return ruta.exists() and os.access(ruta, os.R_OK) and not self.es_ignorado(ruta)
 
-    def _is_ignored_directory(self, dir_name):
-        return dir_name in self.ignored_dirs
+    def _procesar_archivo(self, ruta, mostrar_progreso, contador):
+        if not self._ruta_valida(ruta):
+            return contador
+        self.archivos.append(ArchivoInfo(ruta))
+        contador += 1
+        self._mostrar_progreso(contador, mostrar_progreso)
+        return contador
 
-    def _is_ignored_file(self, path):
-        return path.suffix.lower() in self.ignored_ext or not path.exists() or not os.access(path, os.R_OK)
+    def _mostrar_progreso(self, contador, mostrar_progreso):
+        if mostrar_progreso and contador % 100 == 0:
+            print(f"Procesados {fmt_num(contador)} archivos...")
 
-    def _is_too_deep(self, root):
-        rel_path = Path(root).relative_to(self.base_path)
-        depth = len(rel_path.parts) if rel_path != Path('.') else 0
-        return depth > self.max_depth
+    def esta_muy_profundo(self, ruta):
+        try:
+            return len(ruta.relative_to(self.ruta_base).parts) > self.profundidad_maxima
+        except ValueError:
+            return False
 
-    def _file_infos_in_root(self, root, filenames):
-        return (
-            FileInfo(Path(root) / fname)
-            for fname in filenames
-            if not self._is_ignored_file(Path(root) / fname)
-        )
+    def buscar_archivos(self, incluir_carpetas=False, mostrar_progreso=True):
+        self.archivos = []
+        contador = 0
+        print(f"Explorando {self.ruta_base} hasta {self.profundidad_maxima} niveles...")
 
-    def _directory_infos(self):
-        return (
-            FileInfo(Path(root) / dname)
-            for root, dirs, _ in os.walk(self.base_path)
-            for dname in dirs
-            if not self._is_ignored_directory(dname)
-        )
-
-    def _report_progress(self, count, show_progress):
-        if show_progress and count % 100 == 0:
-            print(f"Procesados {_human_count(count)} archivos...", flush=True)
-
-    def search(self, include_dirs=False, show_progress=True):
-        """Busca archivos recursivamente, con límite de profundidad."""
-        self.files = []
-        count = 0
-        print(f"Explorando {self.base_path} hasta {self.max_depth} niveles de profundidad... (esto puede tardar)")
-
-        for root, dirs, filenames in os.walk(self.base_path):
-            # Filtramos directorios ignorados (modificamos la lista in-place)
-            dirs[:] = [d for d in dirs if not self._is_ignored_directory(d)]
-
-            # Si ya superamos la profundidad, no entramos más abajo
-            if self._is_too_deep(root):
+        for root, dirs, files in os.walk(self.ruta_base, topdown=True):
+            actual = Path(root)
+            if self.esta_muy_profundo(actual):
+                dirs[:] = []
                 continue
+            dirs[:] = [d for d in dirs if d not in CARPETAS_IGNORADAS]
+            if incluir_carpetas:
+                self.archivos.extend(ArchivoInfo(actual / d) for d in dirs)
+            for nombre in files:
+                ruta = actual / nombre
+                contador = self._procesar_archivo(ruta, mostrar_progreso, contador)
 
-            # Procesar archivos
-            for file_info in self._file_infos_in_root(root, filenames):
-                self.files.append(file_info)
-                count += 1
-                self._report_progress(count, show_progress)
+        print(f"Listo — encontrados {fmt_num(len(self.archivos))} elementos.")
+        return self.archivos
 
-        # Si quieren incluir directorios, los añadimos
-        if include_dirs:
-            self.files.extend(self._directory_infos())
+    def ordenar(self, archivos=None, tipo='alfabetico'):
+        archivos = archivos or self.archivos
+        if tipo == 'anio':
+            return sorted(archivos, key=lambda a: a.anio, reverse=True)
+        if tipo == 'tipo':
+            return sorted(archivos, key=lambda a: (a.tipo, a.nombre.lower()))
+        return sorted(archivos, key=lambda a: a.nombre.lower())
 
-        print(f"Listo — encontrados {_human_count(len(self.files))} elementos.")
-        return self.files
+    def agrupar(self, archivos=None, clave=lambda a: a.tipo):
+        grupos = {}
+        for archivo in archivos or self.archivos:
+            grupos.setdefault(clave(archivo), []).append(archivo)
+        return grupos
 
-    def sort_alphabetic(self, files=None):
-        """Orden alfabético (sin distinción mayúsculas)"""
-        if files is None:
-            files = self.files
-        return sorted(files, key=lambda f: f.name.lower())
+    def filtrar_por_extension(self, extensiones, archivos=None):
+        valores = {e.lstrip('.').lower() for e in extensiones}
+        return [a for a in (archivos or self.archivos) if a.tipo in valores]
 
-    def sort_by_year(self, files=None):
-        """Orden por año (más reciente primero)"""
-        if files is None:
-            files = self.files
-        return sorted(files, key=lambda f: f.year, reverse=True)
+    def filtrar_por_rango_anios(self, inicio, fin, archivos=None):
+        return [a for a in (archivos or self.archivos) if inicio <= a.anio <= fin]
 
-    def sort_by_type(self, files=None):
-        """Orden por tipo (extensión) y luego nombre"""
-        if files is None:
-            files = self.files
-        return sorted(files, key=lambda f: (f.tipo, f.name.lower()))
-
-    def group_by_type(self, files=None):
-        """Agrupa por tipo (devuelve dict)"""
-        if files is None:
-            files = self.files
-        grouped = defaultdict(list)
-        for f in files:
-            grouped[f.tipo].append(f)
-        return dict(grouped)
-
-    def group_by_year(self, files=None):
-        """Agrupa por año"""
-        if files is None:
-            files = self.files
-        grouped = defaultdict(list)
-        for f in files:
-            grouped[f.year].append(f)
-        return dict(grouped)
-
-    def filter_by_extension(self, exts, files=None):
-        """Filtra por lista de extensiones (pueden ser '.txt' o 'txt')."""
-        if files is None:
-            files = self.files
-        normalized = {e if e.startswith('.') else '.' + e for e in exts}
-        return [f for f in files if f.ext in normalized or f.tipo in normalized]
-
-    def filter_by_year_range(self, start_year, end_year, files=None):
-        """Filtra por rango de años (inclusive)"""
-        if files is None:
-            files = self.files
-        return [f for f in files if start_year <= f.year <= end_year]
-
-    def generate_report(self, files=None, sort_type='alphabetic'):
-        """Genera un reporte en texto plano con estadísticas y listado."""
-        if files is None:
-            files = self.files
-        if sort_type == 'alphabetic':
-            sorted_files = self.sort_alphabetic(files)
-            title = "Ordenado Alfabéticamente"
-        elif sort_type == 'year':
-            sorted_files = self.sort_by_year(files)
-            title = "Ordenado por Año (más reciente primero)"
-        elif sort_type == 'type':
-            sorted_files = self.sort_by_type(files)
-            title = "Ordenado por Tipo de Archivo"
-        else:
-            sorted_files = files
-            title = "Sin ordenar"
-
-        lines = []
-        lines.append("=" * 80)
-        lines.append(f"REPORTE DE ARCHIVOS - {title}")
-        lines.append("=" * 80)
-        lines.append(f"Directorio base: {self.base_path}")
-        lines.append(f"Total de elementos: {_human_count(len(sorted_files))}")
-        lines.append("-" * 80)
-
-        # Estadísticas por tipo
-        grouped = self.group_by_type(sorted_files)
-        lines.append("\nEstadísticas por tipo:")
-        for t, archivos in sorted(grouped.items()):
-            total_size = sum(archivo.size for archivo in archivos)
-            lines.append(f"  {t}: {len(archivos)} elementos, {FileInfo._format_size(total_size)}")
-
-        lines.append("-" * 80)
-        lines.append("\nDetalle de elementos:")
-        for i, archivo in enumerate(sorted_files, 1):
-            lines.append(f"{i:4d}. {archivo.name}")
-            lines.append(f"      Ruta: {archivo.path}")
-            lines.append(f"      Tipo: {archivo.tipo}")
-            lines.append(f"      Año: {archivo.year}")
-            lines.append(f"      Tamaño: {FileInfo._format_size(archivo.size)}")
-            lines.append(f"      Modificado: {archivo.mod_time.strftime('%Y-%m-%d %H:%M')}")
-            if i < len(sorted_files):
-                lines.append("")
-        lines.append("=" * 80)
-        return "\n".join(lines)
+    def generar_reporte(self, archivos=None, tipo_orden='alfabetico'):
+        archivos = self.ordenar(archivos, tipo_orden)
+        lineas = [
+            '=' * 80,
+            f"REPORTE DE ARCHIVOS - {tipo_orden.title()}",
+            '=' * 80,
+            f"Directorio base: {self.ruta_base}",
+            f"Total de elementos: {fmt_num(len(archivos))}",
+            '-' * 80,
+            '\nEstadísticas por tipo:',
+        ]
+        for tipo, lista in sorted(self.agrupar(archivos).items()):
+            lineas.append(f"  {tipo}: {len(lista)} elementos, {fmt_size(sum(a.tamano for a in lista))}")
+        lineas += ['-' * 80, '\nDetalle de elementos:']
+        for i, archivo in enumerate(archivos, 1):
+            lineas += [
+                f"{i:4d}. {archivo.nombre}",
+                f"      Ruta: {archivo.ruta}",
+                f"      Tipo: {archivo.tipo}",
+                f"      Año: {archivo.anio}",
+                f"      Tamaño: {fmt_size(archivo.tamano)}",
+                f"      Modificado: {archivo.fecha_modificacion.strftime('%Y-%m-%d %H:%M')}",
+            ]
+            if i < len(archivos):
+                lineas.append('')
+        lineas.append('=' * 80)
+        return '\n'.join(lineas)
 
 
-# -------------------------------------------------
-# Opciones del script
-# -------------------------------------------------
-def parse_args():
-    parser = argparse.ArgumentParser(description='Buscador de archivos amigable y fácil de usar')
-    parser.add_argument('--path', default=str(Path.home()),
-                        help='Carpeta donde empezar la búsqueda; si no lo dices, uso tu carpeta home')
-    parser.add_argument('--sort', choices=['alphabetic', 'year', 'type'], default='alphabetic',
-                        help='Ordenar los resultados: alphabetic, year o type')
-    parser.add_argument('--filter', help='Filtrar por extensiones separadas por coma, por ejemplo .txt,.pdf')
-    parser.add_argument('--year-range', help='Rango de años para filtrar, ej: 2020-2024')
+def procesar_argumentos():
+    parser = argparse.ArgumentParser(description='Buscador y organizador de archivos')
+    parser.add_argument('--path', type=Path, default=Path.home(), help='Carpeta donde buscar')
+    parser.add_argument('--sort', choices=['alphabetic', 'year', 'type'], default='alphabetic', help='Ordenar por')
+    parser.add_argument('--filter', help='Filtrar por extensiones (.txt,.pdf)')
+    parser.add_argument('--year-range', help='Filtrar por rango de años AAAA-AAAA')
     parser.add_argument('--max-depth', type=int, default=5, help='Profundidad máxima de búsqueda')
-    parser.add_argument('--include-dirs', action='store_true', help='Incluir carpetas también en el listado')
-    parser.add_argument('--output', help='Guardar el reporte en un archivo')
+    parser.add_argument('--include-dirs', action='store_true', help='Incluir carpetas en el listado')
+    parser.add_argument('--output', help='Guardar reporte en un archivo')
     parser.add_argument('--json', action='store_true', help='Mostrar resultados en formato JSON')
-    parser.add_argument('--no-progress', action='store_true',
-                        help='No mostrar mensajes de progreso durante la búsqueda')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                        help='Mostrar mensajes adicionales para depuración')
-    return parser.parse_args()
+    parser.add_argument('--no-progress', action='store_true', help='No mostrar progreso')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Mostrar mensajes de depuración')
+    return vars(parser.parse_args())
 
 
 def main():
-    args = parse_args()
-    global DEBUG
-    if args.verbose:
-        DEBUG = True
-        print("Modo verbose activado — mostrando detalles")
-
-    try:
-        searcher = FileSearcher(base_path=Path(args.path), max_depth=args.max_depth)
-        files = searcher.search(include_dirs=args.include_dirs,
-                                show_progress=not args.no_progress)
-
-        if not files:
-            print("No encontré ningún archivo en la ruta indicada.")
+    args = procesar_argumentos()
+    if args['verbose']:
+        print('Modo verbose activado — mostrando detalles')
+    
+    buscador = BuscadorArchivos(args['path'], args['max_depth'])
+    archivos = buscador.buscar_archivos(args['include_dirs'], not args['no_progress'])
+    
+    if not archivos:
+        print('No encontré ningún archivo en la ruta indicada.')
+        return
+    
+    if args['filter']:
+        archivos = buscador.filtrar_por_extension(args['filter'].split(','), archivos)
+        print(f"Filtro aplicado — quedan {fmt_num(len(archivos))} elementos")
+    
+    if args['year_range']:
+        try:
+            # quitar espacios antes de dividir
+            year_range_clean = args['year_range'].replace(' ', '')
+            inicio, fin = map(int, year_range_clean.split('-'))
+            archivos = buscador.filtrar_por_rango_anios(inicio, fin, archivos)
+            print(f"Filtro por años aplicado — quedan {fmt_num(len(archivos))} elementos")
+        except ValueError:
+            print('Error: el rango de años debe tener el formato AAAA-AAAA')
             return
-
-        # Filtros
-        if args.filter:
-            exts = [e.strip() for e in args.filter.split(',')]
-            files = searcher.filter_by_extension(exts, files)
-            print(f"Filtro aplicado — quedan {_human_count(len(files))} elementos")
-
-        if args.year_range:
-            try:
-                start, end = map(int, args.year_range.split('-'))
-                files = searcher.filter_by_year_range(start, end, files)
-                print(f"Filtro por años aplicado — quedan {_human_count(len(files))} elementos")
-            except ValueError:
-                print("Error: el rango de años debe tener el formato AAAA-AAAA")
-                sys.exit(1)
-
-        # Preparar el reporte para mostrar o guardar
-        report = searcher.generate_report(files, args.sort)
-
-        if args.json:
-            data = {
-                'base_path': str(searcher.base_path),
-                'total': len(files),
-                'sort': args.sort,
-                'files': [f.to_dict() for f in files]
-            }
-            output = json.dumps(data, indent=2, ensure_ascii=False)
-        else:
-            output = report
-
-        if args.output:
-            with open(args.output, 'w', encoding='utf-8') as f:
-                f.write(output)
-            print(f"He guardado el reporte en {args.output}")
-        else:
-            print(output)
-
-    except KeyboardInterrupt:
-        print("\nInterrupción por teclado. Saliendo.")
-        sys.exit(0)
-    except Exception as e:
-        print(f"Uy, algo salió mal: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
+    
+    # preparar salida
+    if args['json']:
+        salida = json.dumps({
+            'ruta_base': str(buscador.ruta_base),
+            'total': len(archivos),
+            'orden': args['sort'],
+            'archivos': [a.a_diccionario() for a in archivos]
+        }, indent=2, ensure_ascii=False)
+    else:
+        salida = buscador.generar_reporte(archivos, args['sort'])
+    
+    # guardar o mostrar
+    if args['output']:
+        try:
+            Path(args['output']).write_text(salida, encoding='utf-8')
+            print(f"He guardado el reporte en {args['output']}")
+        except Exception as error:
+            print(f'Error al guardar el archivo: {error}')
+    else:
+        print(salida)
 
 
 if __name__ == '__main__':
