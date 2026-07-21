@@ -22,6 +22,13 @@ def debug_print(msg):
     if DEBUG:
         print(f"[DEBUG] {msg}")
 
+def _human_count(n):
+    """Formatea números grandes para que sean fáciles de leer."""
+    try:
+        return f"{n:,}"
+    except Exception:
+        return str(n)
+
 # -------------------------------------------------
 
 class FileInfo:
@@ -29,6 +36,7 @@ class FileInfo:
     def __init__(self, path):
         self.path = path
         self.name = path.name
+        # Si no tiene extensión, le ponemos 'sin_extension'
         self.ext = path.suffix.lower() if path.suffix else 'sin_extension'
         self.size = path.stat().st_size if path.exists() else 0
         self.mod_time = datetime.fromtimestamp(path.stat().st_mtime) if path.exists() else datetime.now()
@@ -81,9 +89,11 @@ class FileInfo:
 class FileSearcher:
     """Busca, ordena y agrupa archivos en un camino dado."""
     def __init__(self, base_path=None, max_depth=5):
+        # Si no dan ruta, usamos el home del usuario
         self.base_path = base_path if base_path else Path.home()
         self.max_depth = max_depth
-        self.files = []
+        self.files = []  # Lista de FileInfo
+        # Extensiones y carpetas que no me interesan (porque son basura)
         self.ignored_ext = {'.tmp', '.temp', '.log', '.cache', '.pyc'}
         self.ignored_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.idea'}
 
@@ -115,29 +125,33 @@ class FileSearcher:
 
     def _report_progress(self, count, show_progress):
         if show_progress and count % 100 == 0:
-            print(f"Ya procesados {count} archivos...", flush=True)
+            print(f"Procesados {_human_count(count)} archivos...", flush=True)
 
     def search(self, include_dirs=False, show_progress=True):
         """Busca archivos recursivamente, con límite de profundidad."""
         self.files = []
         count = 0
-        print(f"Explorando {self.base_path} hasta {self.max_depth} niveles de profundidad...")
+        print(f"Explorando {self.base_path} hasta {self.max_depth} niveles de profundidad... (esto puede tardar)")
 
         for root, dirs, filenames in os.walk(self.base_path):
+            # Filtramos directorios ignorados (modificamos la lista in-place)
             dirs[:] = [d for d in dirs if not self._is_ignored_directory(d)]
 
+            # Si ya superamos la profundidad, no entramos más abajo
             if self._is_too_deep(root):
                 continue
 
+            # Procesar archivos
             for file_info in self._file_infos_in_root(root, filenames):
                 self.files.append(file_info)
                 count += 1
                 self._report_progress(count, show_progress)
 
+        # Si quieren incluir directorios, los añadimos
         if include_dirs:
             self.files.extend(self._directory_infos())
 
-        print(f"Búsqueda completa. Encontrados {len(self.files)} elementos.")
+        print(f"Listo — encontrados {_human_count(len(self.files))} elementos.")
         return self.files
 
     def sort_alphabetic(self, files=None):
@@ -207,20 +221,21 @@ class FileSearcher:
             title = "Sin ordenar"
 
         lines = []
-        lines.append("="*80)
+        lines.append("=" * 80)
         lines.append(f"REPORTE DE ARCHIVOS - {title}")
-        lines.append("="*80)
+        lines.append("=" * 80)
         lines.append(f"Directorio base: {self.base_path}")
-        lines.append(f"Total de elementos: {len(sorted_files)}")
-        lines.append("-"*80)
+        lines.append(f"Total de elementos: {_human_count(len(sorted_files))}")
+        lines.append("-" * 80)
 
+        # Estadísticas por tipo
         grouped = self.group_by_type(sorted_files)
         lines.append("\nEstadísticas por tipo:")
         for t, archivos in sorted(grouped.items()):
             total_size = sum(archivo.size for archivo in archivos)
             lines.append(f"  {t}: {len(archivos)} elementos, {FileInfo._format_size(total_size)}")
 
-        lines.append("-"*80)
+        lines.append("-" * 80)
         lines.append("\nDetalle de elementos:")
         for i, archivo in enumerate(sorted_files, 1):
             lines.append(f"{i:4d}. {archivo.name}")
@@ -231,7 +246,7 @@ class FileSearcher:
             lines.append(f"      Modificado: {archivo.mod_time.strftime('%Y-%m-%d %H:%M')}")
             if i < len(sorted_files):
                 lines.append("")
-        lines.append("="*80)
+        lines.append("=" * 80)
         return "\n".join(lines)
 
 
@@ -240,8 +255,9 @@ class FileSearcher:
 # -------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description='Buscador de archivos amigable y fácil de usar')
-    parser.add_argument('--path', default=str(Path.home()), help='Carpeta donde empezar la búsqueda; si no lo dices, uso tu carpeta home')
-    parser.add_argument('--sort', choices=['alphabetic','year','type'], default='alphabetic',
+    parser.add_argument('--path', default=str(Path.home()),
+                        help='Carpeta donde empezar la búsqueda; si no lo dices, uso tu carpeta home')
+    parser.add_argument('--sort', choices=['alphabetic', 'year', 'type'], default='alphabetic',
                         help='Ordenar los resultados: alphabetic, year o type')
     parser.add_argument('--filter', help='Filtrar por extensiones separadas por coma, por ejemplo .txt,.pdf')
     parser.add_argument('--year-range', help='Rango de años para filtrar, ej: 2020-2024')
@@ -249,8 +265,10 @@ def parse_args():
     parser.add_argument('--include-dirs', action='store_true', help='Incluir carpetas también en el listado')
     parser.add_argument('--output', help='Guardar el reporte en un archivo')
     parser.add_argument('--json', action='store_true', help='Mostrar resultados en formato JSON')
-    parser.add_argument('--no-progress', action='store_true', help='No mostrar mensajes de progreso durante la búsqueda')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Mostrar mensajes adicionales para depuración')
+    parser.add_argument('--no-progress', action='store_true',
+                        help='No mostrar mensajes de progreso durante la búsqueda')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Mostrar mensajes adicionales para depuración')
     return parser.parse_args()
 
 
@@ -259,26 +277,28 @@ def main():
     global DEBUG
     if args.verbose:
         DEBUG = True
-        print("Modo DEBUG activado")
+        print("Modo verbose activado — mostrando detalles")
 
     try:
         searcher = FileSearcher(base_path=Path(args.path), max_depth=args.max_depth)
-        files = searcher.search(include_dirs=args.include_dirs, show_progress=not args.no_progress)
+        files = searcher.search(include_dirs=args.include_dirs,
+                                show_progress=not args.no_progress)
 
         if not files:
-            print("No se encontraron archivos en la ruta indicada.")
+            print("No encontré ningún archivo en la ruta indicada.")
             return
 
+        # Filtros
         if args.filter:
             exts = [e.strip() for e in args.filter.split(',')]
             files = searcher.filter_by_extension(exts, files)
-            print(f"Aplicado filtro de extensiones: {len(files)} elementos restantes")
+            print(f"Filtro aplicado — quedan {_human_count(len(files))} elementos")
 
         if args.year_range:
             try:
                 start, end = map(int, args.year_range.split('-'))
                 files = searcher.filter_by_year_range(start, end, files)
-                print(f"Aplicado filtro por años: {len(files)} elementos restantes")
+                print(f"Filtro por años aplicado — quedan {_human_count(len(files))} elementos")
             except ValueError:
                 print("Error: el rango de años debe tener el formato AAAA-AAAA")
                 sys.exit(1)
@@ -300,15 +320,15 @@ def main():
         if args.output:
             with open(args.output, 'w', encoding='utf-8') as f:
                 f.write(output)
-            print(f"Reporte guardado en {args.output}")
+            print(f"He guardado el reporte en {args.output}")
         else:
             print(output)
 
     except KeyboardInterrupt:
-        print("\n¡Interrupción! El usuario nos ha detenido.")
+        print("\nInterrupción por teclado. Saliendo.")
         sys.exit(0)
     except Exception as e:
-        print(f"Error inesperado: {e}")
+        print(f"Uy, algo salió mal: {e}")
         if args.verbose:
             import traceback
             traceback.print_exc()
